@@ -134,9 +134,14 @@ struct bbr {
 /* Window length of bw filter (in rounds): */
 static const int bbr_bw_rtts = CYCLE_LEN + 2;
 /* Window length of min_rtt filter (in sec): */
-static const u32 bbr_min_rtt_win_sec = 10;
+static u32 bbr_min_rtt_win_sec = 10;
 /* Minimum time (in ms) spent at bbr_cwnd_min_target in BBR_PROBE_RTT mode: */
-static const u32 bbr_probe_rtt_mode_ms = 200;
+static u32 bbr_probe_rtt_mode_ms = 200;
+/* Hold this fraction of the estimated BDP during PROBE_RTT rather than
+ * collapsing to bbr_cwnd_min_target packets (BBRv3 behaviour). Zero keeps
+ * the original BBRv1 collapse.
+ */
+static int bbr_probe_rtt_cwnd_gain = BBR_UNIT * 1 / 2;
 /* Skip TSO below the following bandwidth (bits/sec): */
 static const int bbr_min_tso_rate = 1200000;
 
@@ -194,7 +199,7 @@ static const u32 bbr_lt_bw_diff = 4000 / 8;
 static const u32 bbr_lt_bw_max_rtts = 48;
 
 /* Gain factor for adding extra_acked to target cwnd: */
-static const int bbr_extra_acked_gain = BBR_UNIT;
+static int bbr_extra_acked_gain = BBR_UNIT;
 /* Window length of extra_acked window. Max allowed val is 31. */
 static const u32 bbr_extra_acked_win_rtts = 10;
 /* Max allowed val for ack_epoch_acked, after which sampling epoch is reset */
@@ -203,7 +208,23 @@ static const u32 bbr_ack_epoch_acked_reset_thresh = 1U << 20;
 static const u32 bbr_extra_acked_max_us = 100 * 1000;
 
 /* Each cycle, try to hold sub-unity gain until inflight <= BDP. */
-static const bool bbr_drain_to_target = true;   /* default: enabled */
+static bool bbr_drain_to_target = true;   /* default: enabled */
+
+/* A rebuild of this kernel takes hours, so the knobs worth A/B testing on a
+ * live cellular link are writable at runtime.
+ */
+module_param(bbr_min_rtt_win_sec, uint, 0644);
+MODULE_PARM_DESC(bbr_min_rtt_win_sec, "min_rtt filter window (seconds)");
+module_param(bbr_probe_rtt_mode_ms, uint, 0644);
+MODULE_PARM_DESC(bbr_probe_rtt_mode_ms, "time held at the PROBE_RTT cwnd (ms)");
+module_param(bbr_probe_rtt_cwnd_gain, int, 0644);
+MODULE_PARM_DESC(bbr_probe_rtt_cwnd_gain,
+                 "PROBE_RTT cwnd as a fraction of BDP; 0 collapses to cwnd_min_target");
+module_param(bbr_extra_acked_gain, int, 0644);
+MODULE_PARM_DESC(bbr_extra_acked_gain, "gain applied to the ACK-aggregation cwnd boost");
+module_param(bbr_drain_to_target, bool, 0644);
+MODULE_PARM_DESC(bbr_drain_to_target,
+                 "adaptive PROBE_BW cycling instead of the fixed 8-phase cycle");
 
 static bool tcp_snd_wnd_test(const struct tcp_sock *tp,
                              const struct sk_buff *skb,
@@ -503,6 +524,21 @@ static u32 bbr_ack_aggregation_cwnd(struct sock *sk)
 }
 
 
+/* Returns the cwnd to hold while in PROBE_RTT. BBRv1 collapses all the way to
+ * bbr_cwnd_min_target (4 packets), which on a high-BDP cellular link stalls the
+ * flow once every bbr_min_rtt_win_sec. BBRv3 holds a fraction of the estimated
+ * BDP instead, which still drains the bottleneck queue enough to re-measure
+ * min_rtt.
+ */
+static u32 bbr_probe_rtt_cwnd(struct sock *sk)
+{
+    if (!bbr_probe_rtt_cwnd_gain)
+        return bbr_cwnd_min_target;
+
+    return max_t(u32, bbr_cwnd_min_target,
+                 bbr_bdp(sk, bbr_bw(sk), bbr_probe_rtt_cwnd_gain));
+}
+
 /* An optimization in BBR to reduce losses: On the first round of recovery, we
  * follow the packet conservation principle: send P packets per P packets acked.
  * After that, we slow-start and send at most 2*P packets per P packets acked.
@@ -587,7 +623,7 @@ static void bbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 done:
     tp->snd_cwnd = min(cwnd, tp->snd_cwnd_clamp);   /* apply global cap */
     if (bbr->mode == BBR_PROBE_RTT)  /* drain queue, refresh min_rtt */
-        tp->snd_cwnd = min(tp->snd_cwnd, bbr_cwnd_min_target);
+        tp->snd_cwnd = min(tp->snd_cwnd, bbr_probe_rtt_cwnd(sk));
 }
 
 /* End cycle phase if it's time and/or we hit the phase's in-flight target. */
@@ -1001,7 +1037,7 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
             (tp->delivered + tcp_packets_in_flight(tp)) ? : 1;
         /* Maintain min packets in flight for max(200 ms, 1 round). */
         if (!bbr->probe_rtt_done_stamp &&
-            tcp_packets_in_flight(tp) <= bbr_cwnd_min_target) {
+            tcp_packets_in_flight(tp) <= bbr_probe_rtt_cwnd(sk)) {
             bbr->probe_rtt_done_stamp = tcp_jiffies32 +
                 msecs_to_jiffies(bbr_probe_rtt_mode_ms);
             bbr->probe_rtt_round_done = 0;
