@@ -1,0 +1,121 @@
+name: Build kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Publish the zip as a GitHub release
+        type: boolean
+        default: false
+  push:
+    paths:
+      - 'arch/arm64/configs/vayu_defconfig'
+      - 'net/**'
+      - '.github/workflows/build-kernel.yml'
+
+env:
+  DEFCONFIG: vayu_defconfig
+  CLANG_REPO: https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r547379.git
+  CLANG_BRANCH: '15.0'
+  KBUILD_BUILD_USER: github
+  KBUILD_BUILD_HOST: actions
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk /opt/ghc
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev zip ccache device-tree-compiler \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Cache toolchain
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: clang
+          key: clang-${{ env.CLANG_BRANCH }}-r547379
+
+      - name: Fetch clang
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: git clone -q --depth=1 --single-branch "$CLANG_REPO" -b "$CLANG_BRANCH" clang
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.ref_name }}-
+            ccache-
+
+      - name: Build
+        run: |
+          export PATH="$PWD/clang/bin:$PATH"
+          export ARCH=arm64
+          ccache -M 5G
+
+          make -sj"$(nproc)" O=out ARCH=arm64 "$DEFCONFIG"
+
+          # Same tool overrides build.sh uses: LLVM everywhere, GNU prefixes only
+          # so the 4.14 Makefile picks the right clang target triple.
+          make -j"$(nproc)" O=out \
+            ARCH=arm64 SUBARCH=arm64 DTC_EXT=dtc \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            LD=ld.lld AR=llvm-ar NM=llvm-nm STRIP=llvm-strip \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump READELF=llvm-readelf \
+            HOSTCC=clang HOSTCXX=clang++ HOSTAR=llvm-ar HOSTLD=ld.lld \
+            LLVM=1 LLVM_IAS=1 CC="ccache clang"
+
+      - name: Verify build output
+        run: |
+          test -f out/arch/arm64/boot/Image || { echo "::error::Image missing"; exit 1; }
+          test -f out/arch/arm64/boot/dtbo.img || { echo "::error::dtbo.img missing"; exit 1; }
+          ls -lh out/arch/arm64/boot/Image out/arch/arm64/boot/dtbo.img
+          ccache -s | head -5
+
+      - name: Package AnyKernel3 zip
+        id: pack
+        run: |
+          git clone -q --depth=1 https://github.com/AnymoreProject/AnyKernel3.git ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md
+          cp out/arch/arm64/boot/Image ak3/
+          cp out/arch/arm64/boot/dtbo.img ak3/
+          [ -f out/arch/arm64/boot/dtb.img ] && cp out/arch/arm64/boot/dtb.img ak3/
+
+          name="AnymoreKernel-netopt-vayu-$(date -u +%Y%m%d-%H%M)-${GITHUB_SHA::7}"
+          (cd ak3 && zip -qr9 "../$name.zip" .)
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          ls -lh "$name.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.name }}
+          path: ${{ steps.pack.outputs.name }}.zip
+          if-no-files-found: error
+
+      - name: Publish release
+        if: inputs.release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.pack.outputs.name }}" \
+            "${{ steps.pack.outputs.name }}.zip" \
+            --title "${{ steps.pack.outputs.name }}" \
+            --notes "fq_codel default qdisc + BBRPlus PROBE_RTT backport. Flash in recovery."
