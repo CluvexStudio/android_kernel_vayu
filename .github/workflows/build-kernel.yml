@@ -24,6 +24,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    # gh release create needs write access; the default token is read-only here.
+    permissions:
+      contents: write
 
     steps:
       - name: Reclaim runner disk
